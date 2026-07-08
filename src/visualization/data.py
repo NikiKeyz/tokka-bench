@@ -198,6 +198,21 @@ def results_to_dataframe(results: Dict[str, Any]) -> pd.DataFrame:
         # Fallback: no ranking
         df["language_rank"] = None
 
+    # Disambiguate languages that share a display name across scripts
+    # (e.g. Serbian appears as Cyrl and Latn). Keying selection/filtering on the
+    # unique ``lang_key`` plus this label prevents a script preset from pulling
+    # in the wrong script variant. Labels only get a "(Script)" suffix when the
+    # same name is used by more than one script; otherwise the plain name is kept.
+    try:
+        name_counts = df["language"].value_counts()
+        multi_names = set(name_counts[name_counts > 1].index)
+        df["lang_label"] = df["language"].where(
+            ~df["language"].isin(multi_names),
+            df["language"] + " (" + df["script"] + ")",
+        )
+    except Exception:
+        df["lang_label"] = df["language"]
+
     return df
 
 

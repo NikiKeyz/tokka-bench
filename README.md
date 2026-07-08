@@ -75,6 +75,16 @@ Tips:
 - You can control language counts: `natural_n=99 code_n=20`
 - Adjust speed vs accuracy via `sample_size` (MB)
 
+### Script-Level Aggregation
+
+Each result JSON also includes a top-level `script_aggregations` object that
+groups every language by its Unicode script and reports `min` / `median` /
+`max` (plus the holding language) for `bytes_per_token`, `unique_tokens` and
+`subword_fertility`. The **min bytes/token** is the realistic worst case for
+that script — use it when you must guarantee no context overflow for
+low-resource scripts (e.g. `Cyrl` min is Mongolian, not Russian). See
+`src/tokka_bench/fast_benchmark.py:aggregate_by_script`.
+
 ### What’s Measured
 
 - **bytes_per_token**: higher = more efficient

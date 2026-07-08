@@ -152,6 +152,42 @@ def print_global_metrics(results):
     print("─" * METRICS_SECTION_WIDTH)
 
 
+def print_script_aggregations(results):
+    """Print per-script min/median/max of bytes/token (worst-case aware)."""
+    if not results or "script_aggregations" not in results:
+        return
+
+    aggs = results["script_aggregations"]
+    if not aggs:
+        return
+
+    print("\n🔤 Script Aggregations (bytes/token: worst→best case):")
+    print("─" * METRICS_SECTION_WIDTH)
+    header = (
+        f"{'Script':<{SCRIPT_NAME_WIDTH+2}}"
+        f"{'#':>3}"
+        f"{'min':>{BYTES_TOKEN_COLUMN_WIDTH}}"
+        f"{'median':>{BYTES_TOKEN_COLUMN_WIDTH}}"
+        f"{'max':>{BYTES_TOKEN_COLUMN_WIDTH}}"
+        f"  worst-case lang"
+    )
+    print(header)
+    print("─" * METRICS_SECTION_WIDTH)
+
+    for script in sorted(aggs.keys()):
+        block = aggs[script]
+        bpt = block.get("bytes_per_token", {})
+        worst = bpt.get("min_language", "")
+        print(
+            f"{script:<{SCRIPT_NAME_WIDTH+2}}"
+            f"{block.get('num_languages', 0):>3}"
+            f"{bpt.get('min', 0):>{BYTES_TOKEN_COLUMN_WIDTH-1}.2f}"
+            f"{bpt.get('median', 0):>{BYTES_TOKEN_COLUMN_WIDTH-1}.2f}"
+            f"{bpt.get('max', 0):>{BYTES_TOKEN_COLUMN_WIDTH-1}.2f}"
+            f"  {worst}"
+        )
+
+
 def parse_config():
     """Parse CLI configuration."""
     try:
@@ -331,6 +367,7 @@ def main():
             print(f"\n📊 Results for {tokenizer_name}:")
             print_summary(results)
             print_global_metrics(results)
+            print_script_aggregations(results)
 
         print("\n✅ All benchmarks completed successfully!")
 

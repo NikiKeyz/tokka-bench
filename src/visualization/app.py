@@ -19,6 +19,9 @@ from .charts import (
     create_subword_fertility_chart,
     create_word_splitting_rate_chart,
     create_vocab_efficiency_scatter,
+    create_script_safety_chart,
+    create_script_efficiency_chart,
+    compute_script_safety_table,
 )
 from .data import load_all_results, results_to_dataframe, get_tokenizer_summary
 
@@ -65,6 +68,9 @@ def main():
     df = results_to_dataframe(results)
     tokenizer_summary = get_tokenizer_summary(results)
 
+    # Map unique lang_key -> display label for unambiguous selection widgets
+    lang_label_map = dict(zip(df["lang_key"], df["lang_label"]))
+
     # Build language categories early so we can set a friendly default selection
     language_categories = detect_language_types(df)
     st.session_state["language_categories"] = language_categories
@@ -110,7 +116,7 @@ def main():
     if "selected_languages" not in st.session_state:
         top_30 = language_categories.get("Top 30 Natural", [])
         st.session_state.selected_languages = (
-            top_30 if top_30 else list(df["language"].unique())
+            top_30 if top_30 else list(df["lang_key"].unique())
         )
 
     selected_tokenizers = st.session_state.selected_tokenizers
@@ -122,7 +128,7 @@ def main():
     # Build subset according to current selection state
     display_df = df[
         (df["tokenizer_key"].isin(selected_tokenizers))
-        & (df["language"].isin(selected_languages))
+        & (df["lang_key"].isin(selected_languages))
     ]
 
     (
@@ -131,6 +137,8 @@ def main():
         continued_tab,
         fertility_tab,
         analysis_tab,
+        script_safety_tab,
+        script_eff_tab,
         raw_tab,
     ) = st.tabs(
         [
@@ -139,6 +147,8 @@ def main():
             "Word Splitting Rate",
             "Subword Fertility",
             "Comparisons",
+            "Script Safety",
+            "Script Efficiency",
             "Raw Data",
         ]
     )
@@ -206,6 +216,38 @@ def main():
                 use_container_width=True,
             )
 
+    with script_safety_tab:
+        if display_df.empty:
+            st.info("No data for current selection. Adjust filters below.")
+        else:
+            st.caption(
+                "Worst-case (min) bytes/token per script across its languages. "
+                "Low min = fewest bytes per token = most tokens per byte, i.e. the "
+                "script most likely to overflow a context window. Use the min value "
+                "to safely size token budgets for low-resource scripts."
+            )
+            st.plotly_chart(
+                create_script_safety_chart(display_df, selected_tokenizers),
+                use_container_width=True,
+            )
+            safety_df = compute_script_safety_table(display_df, selected_tokenizers)
+            if not safety_df.empty:
+                st.dataframe(safety_df, use_container_width=True, hide_index=True)
+
+    with script_eff_tab:
+        if display_df.empty:
+            st.info("No data for current selection. Adjust filters below.")
+        else:
+            st.caption(
+                "Median bytes per token per script (aggregated across that "
+                "script's languages). Higher = more efficient. Compare tokenizers "
+                "within a script; this is the script-level analog of the Efficiency tab."
+            )
+            st.plotly_chart(
+                create_script_efficiency_chart(display_df, selected_tokenizers),
+                use_container_width=True,
+            )
+
     with raw_tab:
         if display_df.empty:
             st.info("No data for current selection. Adjust filters below.")
@@ -262,7 +304,8 @@ def main():
     with lang_col:
         st.multiselect(
             "Languages",
-            options=list(df["language"].unique()),
+            options=list(df["lang_key"].unique()),
+            format_func=lambda lk: lang_label_map.get(lk, lk),
             key="selected_languages",
         )
 
@@ -277,7 +320,7 @@ def main():
 
     # Build dropdowns using short names from result filenames (tokenizer_key)
     tok_keys = sorted(df["tokenizer_key"].unique())
-    lang_names = list(df["language"].unique())
+    lang_keys = list(df["lang_key"].unique())
 
     col_tok, col_lang = st.columns(2)
     with col_tok:
@@ -292,19 +335,20 @@ def main():
         )
     with col_lang:
         default_lang_index = (
-            lang_names.index(selected_languages[0]) if selected_languages else 0
+            lang_keys.index(selected_languages[0]) if selected_languages else 0
         )
-        selected_lang_name = st.selectbox(
+        selected_lang_key = st.selectbox(
             "Language",
-            options=lang_names,
+            options=lang_keys,
             index=default_lang_index,
-            key="preview_language_name",
+            format_func=lambda lk: lang_label_map.get(lk, lk),
+            key="preview_language_key",
         )
 
     # Retrieve matching row and show sample text
     preview_df = df[
         (df["tokenizer_key"] == selected_tok_key)
-        & (df["language"] == selected_lang_name)
+        & (df["lang_key"] == selected_lang_key)
     ]
 
     if preview_df.empty or "sample_text" not in preview_df.columns:

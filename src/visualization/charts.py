@@ -109,7 +109,7 @@ def create_efficiency_chart(
     chart_data = prepare_chart_data(df, selected_tokenizers)
     return create_bar_chart(
         chart_data,
-        x="language",
+        x="lang_label",
         y="bytes_per_token",
         title="Tokenization Efficiency (Bytes per Token)",
         y_label="Bytes per Token (Higher = More Efficient)",
@@ -123,7 +123,7 @@ def create_coverage_chart(
     chart_data = prepare_chart_data(df, selected_tokenizers)
     return create_bar_chart(
         chart_data,
-        x="language",
+        x="lang_label",
         y="unique_tokens",
         title="Vocabulary Coverage (Unique Tokens Used)",
         y_label="Unique Tokens (Higher = Better Coverage)",
@@ -163,7 +163,7 @@ def create_subword_fertility_chart(
 
     return create_bar_chart(
         chart_data,
-        x="language",
+        x="lang_label",
         y="subword_fertility",
         title="Subword Fertility (Subwords per Word)",
         y_label="Subwords per Word (Higher = More Fragmented)",
@@ -203,7 +203,7 @@ def create_word_splitting_rate_chart(
 
     return create_bar_chart(
         chart_data,
-        x="language",
+        x="lang_label",
         y="word_split_pct",
         title="Word Splitting Rate (% of Units Split)",
         y_label="Word Splitting Rate (%)",
@@ -437,3 +437,199 @@ def create_vocab_efficiency_scatter(
 def create_summary_table(*args, **kwargs):
     """Deprecated: summary table no longer used in the streamlined dashboard."""
     raise NotImplementedError("create_summary_table is no longer supported")
+
+
+def compute_script_safety_table(
+    df: pd.DataFrame, selected_tokenizers: List[str]
+) -> pd.DataFrame:
+    """Build a script-level worst-case table from per-language rows.
+
+    For each (tokenizer, script) group reports min/median/max bytes/token and
+    the language holding the worst case (min bytes/token -> most tokens per
+    byte -> highest context-overflow risk). Coding ("code") rows are excluded.
+    """
+    import statistics
+
+    sub = df[df["tokenizer_key"].isin(selected_tokenizers)].copy()
+    if sub.empty:
+        return pd.DataFrame()
+
+    rows = []
+    grouped = sub[sub["script"] != "code"].groupby(
+        ["tokenizer_name", "script"], sort=False
+    )
+    for (tok_name, script), g in grouped:
+        bpt = g["bytes_per_token"].dropna()
+        if bpt.empty:
+            continue
+        min_idx = bpt.idxmin()
+        worst_label = str(g.loc[min_idx, "lang_label"])
+        rows.append(
+            {
+                "tokenizer": tok_name,
+                "script": script,
+                "num_languages": int(g["lang_key"].nunique()),
+                "min_bytes_per_token": float(bpt.min()),
+                "median_bytes_per_token": float(statistics.median(bpt)),
+                "max_bytes_per_token": float(bpt.max()),
+                "worst_case_language": worst_label,
+            }
+        )
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    # Sort by worst case per tokenizer so the riskiest scripts surface first
+    out = out.sort_values(
+        ["tokenizer", "min_bytes_per_token"], ascending=[True, True]
+    ).reset_index(drop=True)
+    return out
+
+
+def create_script_safety_chart(
+    df: pd.DataFrame, selected_tokenizers: List[str]
+) -> go.Figure:
+    """Bar chart of the worst-case (min) bytes/token per script per tokenizer.
+
+    The min is the realistic worst case for that script: fewest bytes per token
+    means the most tokens per byte, i.e. the script most likely to overflow a
+    context window. Use this to size conservative token budgets.
+    """
+    table = compute_script_safety_table(df, selected_tokenizers)
+    if table.empty:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="Script safety data not available",
+            xref="paper",
+            yref="paper",
+            x=0.5,
+            y=0.5,
+            xanchor="center",
+            yanchor="middle",
+            showarrow=False,
+            font=dict(size=16, color="gray"),
+        )
+        fig.update_layout(
+            title="Worst-Case (Min) Bytes per Token per Script",
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+            height=CHART_HEIGHT,
+        )
+        return fig
+
+    fig = px.bar(
+        table,
+        x="script",
+        y="min_bytes_per_token",
+        color="tokenizer",
+        barmode="group",
+        title="Worst-Case (Min) Bytes per Token per Script",
+        labels={
+            "script": "Script",
+            "min_bytes_per_token": "Min Bytes/Token (Lower = More Tokens/Riskier)",
+            "tokenizer": "Tokenizer",
+        },
+        height=CHART_HEIGHT,
+    )
+    fig.update_layout(
+        xaxis_tickangle=-45,
+        legend=LEGEND_CONFIG,
+        margin=dict(t=120),
+        title=dict(y=0.995),
+    )
+    return fig
+
+
+def create_script_efficiency_chart(
+    df: pd.DataFrame, selected_tokenizers: List[str]
+) -> go.Figure:
+    """Script-level analog of the per-language Efficiency chart.
+
+    Aggregates bytes/token to the script level (median across that script's
+    languages, with min/max error bars) so tokenizers can be compared on a
+    per-script basis rather than per-language. Coding ("code") rows are excluded
+    since code is not a script.
+    """
+    sub = df[
+        (df["tokenizer_key"].isin(selected_tokenizers)) & (df["script"] != "code")
+    ].copy()
+    if sub.empty:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="Script efficiency data not available",
+            xref="paper",
+            yref="paper",
+            x=0.5,
+            y=0.5,
+            xanchor="center",
+            yanchor="middle",
+            showarrow=False,
+            font=dict(size=16, color="gray"),
+        )
+        fig.update_layout(
+            title="Tokenization Efficiency by Script (Bytes per Token)",
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+            height=CHART_HEIGHT,
+        )
+        return fig
+
+    # Per (tokenizer, script): median (bar) plus min/max whiskers.
+    grouped = sub.groupby(["tokenizer_name", "script"], sort=False)[
+        "bytes_per_token"
+    ]
+    stats = grouped.agg(["median", "min", "max"]).reset_index()
+    stats = stats.rename(
+        columns={"median": "med", "min": "mn", "max": "mx"}
+    )
+
+    # Stable script order (by overall median, descending) so bars group cleanly
+    script_order = (
+        stats.groupby("script")["med"].mean().sort_values(ascending=False).index.tolist()
+    )
+    tokenizer_order = get_global_tokenizer_order(df, selected_tokenizers)
+
+    fig = go.Figure()
+    for tok in tokenizer_order:
+        t = stats[stats["tokenizer_name"] == tok]
+        by_script = {row["script"]: row for _, row in t.iterrows()}
+        med = []
+        err_plus = []
+        err_minus = []
+        for s in script_order:
+            if s in by_script:
+                row = by_script[s]
+                med.append(row["med"])
+                err_plus.append(row["mx"] - row["med"])
+                err_minus.append(row["med"] - row["mn"])
+            else:
+                med.append(None)
+                err_plus.append(None)
+                err_minus.append(None)
+        fig.add_trace(
+            go.Bar(
+                name=tok,
+                x=script_order,
+                y=med,
+                error_y=dict(
+                    type="data",
+                    symmetric=False,
+                    array=err_plus,
+                    arrayminus=err_minus,
+                    thickness=1.2,
+                    width=3,
+                ),
+            )
+        )
+
+    fig.update_layout(
+        barmode="group",
+        title=dict(text="Tokenization Efficiency by Script (Bytes per Token)", y=0.995),
+        xaxis_tickangle=-45,
+        xaxis_title="Script",
+        yaxis_title="Bytes/Token (median, whiskers = min-max)",
+        legend=LEGEND_CONFIG,
+        margin=dict(t=120),
+        height=CHART_HEIGHT,
+    )
+    return fig

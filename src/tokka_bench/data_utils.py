@@ -6,16 +6,22 @@ from various datasets (FineWeb-2, StarCoder, FineWeb).
 """
 
 import gc
+import hashlib
 import os
+import time
 from typing import Dict, List
 
 import pandas as pd
+
+# Local on-disk cache for per-language sample text. Only the ~sample_size_mb
+# that is actually consumed is stored (never the full dataset), so 100 languages
+# at 2 MB each is roughly 200 MB on disk.
+SAMPLE_CACHE_DIR = os.path.join("data", "cache", "samples")
 
 # Constants for data processing
 TB_TO_GB_FACTOR = 1000
 MB_TO_GB_FACTOR = 1000
 MB_TO_BYTES_FACTOR = 1024 * 1024
-FALLBACK_TEXT_REPETITIONS = 1000
 DEFAULT_CODING_LANGUAGES = 10
 DEFAULT_TOP_LANGUAGES = 5
 
@@ -141,108 +147,181 @@ def get_english_fineweb() -> Dict[str, str]:
     }
 
 
-def load_real_sample_text(
-    language_info: Dict[str, str], sample_size_mb: float = 2.0, verbose: bool = False
+def _sample_cache_path(
+    language_info: Dict[str, str],
+    sample_size_mb: float,
+    cache_dir: str,
 ) -> str:
-    """Load real sample text from appropriate dataset based on source."""
+    """Stable cache file path for a given language + sample size."""
+    source = language_info.get("source", "fineweb2")
+    iso = language_info.get("iso_code", "")
+    script = language_info.get("script", "")
+    data_dir = language_info.get("data_dir", "")
+    raw = f"{source}|{iso}|{script}|{data_dir}|{sample_size_mb}"
+    key = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(cache_dir, f"{key}.txt")
+
+
+def load_real_sample_text(
+    language_info: Dict[str, str],
+    sample_size_mb: float = 2.0,
+    verbose: bool = False,
+    max_retries: int = 3,
+    use_cache: bool = True,
+    cache_dir: str = SAMPLE_CACHE_DIR,
+) -> str:
+    """Load real sample text from appropriate dataset based on source.
+
+    Caches the consumed bytes (~``sample_size_mb``) to a local file so repeated
+    runs do not re-stream from HuggingFace. With a warm cache, HF is never
+    contacted. Retries transient failures (e.g. ``datasets`` parquet
+    ``CastError`` or ``tqdm`` lock races under high concurrency), and
+    re-attempts when a stream yields zero bytes. Never falls back to synthetic
+    text — failures raise after retries are exhausted.
+    """
     from datasets import load_dataset
 
     # Use the module constant for bytes-per-MB conversion
     target_bytes: int = int(sample_size_mb * MB_TO_BYTES_FACTOR)
     source: str = language_info.get("source", "fineweb2")
 
+    cache_path = ""
+    if use_cache:
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_path = _sample_cache_path(language_info, sample_size_mb, cache_dir)
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    cached = f.read()
+                if verbose:
+                    print(
+                        f"    Loaded {len(cached.encode('utf-8')):,} bytes from cache "
+                        f"({os.path.relpath(cache_path)})"
+                    )
+                return cached
+            except OSError:
+                # Corrupt/unreadable cache — fall through to re-download.
+                pass
+
     if verbose:
         print(f"    Loading real data from {source}...")
 
-    try:
-        # Load dataset based on source
+    def _open_stream():
         if source == "fineweb2":
-            # FineWeb-2 dataset
             dataset_name: str = f"{language_info['iso_code']}_{language_info['script']}"
-            fw = load_dataset(
-                "HuggingFaceFW/fineweb-2",
-                name=dataset_name,
-                split="train",
-                streaming=True,
+            return (
+                load_dataset(
+                    "HuggingFaceFW/fineweb-2",
+                    name=dataset_name,
+                    split="train",
+                    streaming=True,
+                    # Some shards carry extra columns (e.g. `wordlist_ratio`)
+                    # absent from the subset schema, which makes the strict
+                    # schema cast fail with a CastError. Requesting only the
+                    # column we need sidesteps that entirely.
+                    columns=["text"],
+                ),
+                "text",
             )
-            content_key: str = "text"
-
         elif source == "fineweb":
-            # FineWeb English dataset
-            fw = load_dataset(
-                "HuggingFaceFW/fineweb",
-                name="sample-10BT",
-                split="train",
-                streaming=True,
+            return (
+                load_dataset(
+                    "HuggingFaceFW/fineweb",
+                    name="sample-10BT",
+                    split="train",
+                    streaming=True,
+                    columns=["text"],
+                ),
+                "text",
             )
-            content_key = "text"
-
         elif source == "starcoder":
-            # StarCoder dataset
             data_dir: str = language_info.get("data_dir", language_info["iso_code"])
-            fw = load_dataset(
-                "bigcode/starcoderdata",
-                data_dir=data_dir,
-                split="train",
-                streaming=True,
+            return (
+                load_dataset(
+                    "bigcode/starcoderdata",
+                    data_dir=data_dir,
+                    split="train",
+                    streaming=True,
+                    columns=["content"],
+                ),
+                "content",
             )
-            content_key = "content"
-
         else:
             raise ValueError(f"Unknown source: {source}")
 
-        # Accumulate text until we reach target size
-        accumulated_text: List[str] = []
-        total_bytes: int = 0
-
-        # Use iterator to ensure we can clean up properly
-        dataset_iter = iter(fw)
-
+    last_err: Exception = RuntimeError("no attempts made")
+    for attempt in range(1, max_retries + 1):
+        fw = None
+        dataset_iter = None
         try:
-            while total_bytes < target_bytes:
-                sample = next(dataset_iter)
-                text: str = sample.get(content_key, "")
-                if text:
-                    accumulated_text.append(text)
-                    total_bytes += len(text.encode("utf-8"))
-        except StopIteration:
-            # End of dataset reached
-            pass
+            fw, content_key = _open_stream()
 
-        # Join all accumulated text
-        full_text: str = "\n".join(accumulated_text)
+            # Accumulate text until we reach target size
+            accumulated_text: List[str] = []
+            total_bytes: int = 0
 
-        # Truncate to exact size if needed
-        text_bytes: bytes = full_text.encode("utf-8")
-        if len(text_bytes) > target_bytes:
-            full_text = text_bytes[:target_bytes].decode("utf-8", errors="ignore")
+            dataset_iter = iter(fw)
+            try:
+                while total_bytes < target_bytes:
+                    sample = next(dataset_iter)
+                    text: str = sample.get(content_key, "")
+                    if text:
+                        accumulated_text.append(text)
+                        total_bytes += len(text.encode("utf-8"))
+            except StopIteration:
+                # End of dataset reached
+                pass
 
-        if verbose:
-            print(f"    Loaded {len(full_text.encode('utf-8')):,} bytes of real data")
+            # A stream that ends immediately (0 bytes) is a classic symptom of a
+            # concurrent parquet cast failure; treat it as a retryable error.
+            if total_bytes == 0:
+                last_err = RuntimeError("stream yielded 0 bytes")
+                if verbose:
+                    print(
+                        f"    Warning: 0 bytes loaded (attempt {attempt}/{max_retries}), retrying..."
+                    )
+                time.sleep(0.5 * attempt)
+                continue
 
-        # Simple cleanup
-        del fw
-        del dataset_iter
-        gc.collect()
+            # Join all accumulated text
+            full_text: str = "\n".join(accumulated_text)
 
-        return full_text
+            # Truncate to exact size if needed
+            text_bytes: bytes = full_text.encode("utf-8")
+            if len(text_bytes) > target_bytes:
+                full_text = text_bytes[:target_bytes].decode("utf-8", errors="ignore")
 
-    except (ValueError, KeyError, ImportError, ConnectionError, OSError) as e:
-        if verbose:
-            print(f"    Warning: Could not load real data ({e}), using fallback text")
-        # Fallback to a simple sample if dataset loading fails
-        lang_name = language_info.get("name", "unknown language")
-        base_text: str = (
-            f"Sample text for {lang_name} tokenizer testing. "
-            * FALLBACK_TEXT_REPETITIONS
-        )
+            if verbose:
+                print(
+                    f"    Loaded {len(full_text.encode('utf-8')):,} bytes of real data"
+                )
 
-        # Adjust size to target exactly in UTF-8 bytes
-        base_bytes: bytes = base_text.encode("utf-8")
-        if len(base_bytes) >= target_bytes:
-            adjusted = base_bytes[:target_bytes]
-        else:
-            repeat_count: int = (target_bytes // len(base_bytes)) + 1
-            adjusted = (base_bytes * repeat_count)[:target_bytes]
+            # Persist to local cache (atomic write) for subsequent runs.
+            if use_cache:
+                tmp_path = cache_path + ".tmp"
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    f.write(full_text)
+                os.replace(tmp_path, cache_path)
 
-        return adjusted.decode("utf-8", errors="ignore")
+            return full_text
+
+        except (ValueError, KeyError, ImportError, ConnectionError, OSError) as e:
+            last_err = e
+            if verbose:
+                print(
+                    f"    Warning: load failed (attempt {attempt}/{max_retries}): {e}"
+                )
+            time.sleep(0.5 * attempt)
+            continue
+        finally:
+            # Simple cleanup
+            del fw
+            del dataset_iter
+            gc.collect()
+
+    lang_name = language_info.get("name", language_info.get("iso_code", "unknown"))
+    raise RuntimeError(
+        f"Failed to load REAL data for '{lang_name}' after {max_retries} attempts "
+        f"(last error: {last_err!r}). Refusing to use synthetic fallback text — "
+        f"rerun with fewer workers or check network/HF access."
+    )

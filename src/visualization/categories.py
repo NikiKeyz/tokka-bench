@@ -7,8 +7,6 @@ from pathlib import Path
 
 import pandas as pd
 
-# SCRIPT_GROUPS is not needed in the streamlined categories
-
 
 def detect_language_types(df: pd.DataFrame) -> Dict[str, List[str]]:
     """Build the exact category sets requested, with careful ordering and labeling.
@@ -21,39 +19,45 @@ def detect_language_types(df: pd.DataFrame) -> Dict[str, List[str]]:
     - Coding
     - European
     - Non-European
-    - Latin Script
-    - Cyrillic Script
-    - Arabic Script
-    - CJK Scripts
+    - One preset per Unicode script present in the data (e.g. "Script: Cyrl")
+
+    All category lists contain unique ``lang_key`` values (iso_script), NOT
+    display names, so a script preset can never accidentally include a different
+    script variant that happens to share a language name (e.g. Serbian Cyrl vs
+    Serbian Latn).
     """
 
-    # Languages present in the dataset
-    all_languages = list(df["language"].unique())
+    # Unique language entries (one per iso_script variant)
+    all_keys: List[str] = list(df["lang_key"].unique())
+
+    def info(lk: str) -> pd.Series:
+        return df[df["lang_key"] == lk].iloc[0]
 
     # Popularity order if available (lower rank = more popular)
-    language_rank_map: Dict[str, Optional[float]] = (
-        df.groupby("language")["language_rank"].min().to_dict()
+    rank_map: Dict[str, Optional[float]] = (
+        df.groupby("lang_key")["language_rank"].min().to_dict()
         if "language_rank" in df.columns
         else {}
     )
 
-    def rank_key(lang: str) -> float:
-        rank = language_rank_map.get(lang)
+    def rank_key(lk: str) -> float:
+        rank = rank_map.get(lk)
         return rank if rank is not None else 1e9
 
     # Identify programming vs natural and English
     programming_languages: List[str] = []
     natural_languages: List[str] = []
     english_languages: List[str] = []
-    for lang in all_languages:
-        lang_row = df[df["language"] == lang].iloc[0]
-        script_value = str(lang_row.get("script", "")).lower()
-        if "(code)" in str(lang).lower() or script_value == "code":
-            programming_languages.append(lang)
-        elif "english" in str(lang).lower():
-            english_languages.append(lang)
+    for lk in all_keys:
+        r = info(lk)
+        script_value = str(r.get("script", "")).lower()
+        name_value = str(r.get("language", ""))
+        if "(code)" in name_value.lower() or script_value == "code":
+            programming_languages.append(lk)
+        elif "english" in name_value.lower():
+            english_languages.append(lk)
         else:
-            natural_languages.append(lang)
+            natural_languages.append(lk)
 
     # Ordering
     natural_by_rank = sorted(natural_languages, key=rank_key)
@@ -64,24 +68,23 @@ def detect_language_types(df: pd.DataFrame) -> Dict[str, List[str]]:
 
     # Natural ranges with English at the front of Top 30
     top_natural_with_english: List[str] = english_languages[:1] + [
-        l for l in natural_by_rank if l not in english_languages
+        l for l in natural_by_rank if l not in set(english_languages)
     ]
     top_30_natural = top_natural_with_english[:30]
     natural_31_60 = top_natural_with_english[30:60]
     natural_61_100 = top_natural_with_english[60:100]
 
-    # Script groupings from df
+    # Script mapping per lang_key
     script_map: Dict[str, str] = {
-        lang: str(df[df["language"] == lang].iloc[0].get("script", ""))
-        for lang in all_languages
+        lk: str(info(lk).get("script", "")).lower() for lk in all_keys
     }
-    latin_script = [l for l, s in script_map.items() if "latn" in s.lower()]
-    cyrillic_script = [l for l, s in script_map.items() if "cyrl" in s.lower()]
-    arabic_script = [l for l, s in script_map.items() if "arab" in s.lower()]
+    latin_script = [lk for lk, s in script_map.items() if "latn" in s]
+    cyrillic_script = [lk for lk, s in script_map.items() if "cyrl" in s]
+    arabic_script = [lk for lk, s in script_map.items() if "arab" in s]
     cjk_scripts = [
-        l
-        for l, s in script_map.items()
-        if any(tag in s.lower() for tag in ["hani", "jpan", "hang"])
+        lk
+        for lk, s in script_map.items()
+        if any(tag in s for tag in ["hani", "jpan", "hang"])
     ]
 
     # European vs Non-European using CSV families plus script as a guard
@@ -99,13 +102,15 @@ def detect_language_types(df: pd.DataFrame) -> Dict[str, List[str]]:
         european_families = {"Indo-European", "Uralic", "Turkic", "Kartvelian"}
         european_name_exceptions = {"Basque", "Maltese"}
 
-        def is_european(lang: str) -> bool:
+        def is_european(lk: str) -> bool:
             # Ignore coding
-            if lang in programming_languages:
+            if lk in programming_languages:
                 return False
-            fam = name_to_family.get(lang, "")
-            scr = script_map.get(lang, "").lower()
-            if lang in european_name_exceptions:
+            r = info(lk)
+            fam = name_to_family.get(str(r.get("language", "")), "")
+            scr = str(r.get("script", "")).lower()
+            name_val = str(r.get("language", ""))
+            if name_val in european_name_exceptions:
                 return True
             # Require European-associated script and qualifying family
             if any(tag in scr for tag in ["latn", "cyrl", "grek"]) and (
@@ -114,19 +119,56 @@ def detect_language_types(df: pd.DataFrame) -> Dict[str, List[str]]:
                 return True
             return False
 
-        european = [l for l in natural_by_rank if is_european(l)]
+        european = [lk for lk in natural_by_rank if is_european(lk)]
     except Exception:
         # Fallback: script-only heuristic
         european = [
-            l
-            for l, s in script_map.items()
-            if any(tag in s.lower() for tag in ["latn", "cyrl", "grek"])
-            and l in natural_languages
+            lk
+            for lk, s in script_map.items()
+            if any(tag in s for tag in ["latn", "cyrl", "grek"])
+            and lk in natural_languages
         ]
 
-    non_european = [l for l in natural_by_rank if l not in set(european)]
+    non_european = [lk for lk in natural_by_rank if lk not in set(european)]
 
-    return {
+    # One preset per script actually present in the data, so every script is
+    # selectable (not just the four hard-coded ones).
+    script_codes = sorted({s for s in script_map.values() if s and s != "code"})
+    per_script: Dict[str, List[str]] = {}
+    for code in script_codes:
+        per_script[f"Script: {code.upper()}"] = [
+            lk for lk, s in script_map.items() if s == code
+        ]
+
+    # Script families: linguistically related scripts grouped together (the
+    # same idea as the existing "CJK Scripts" bucket). Each family collects the
+    # lang_keys whose script code belongs to that family.
+    SCRIPT_FAMILIES: Dict[str, List[str]] = {
+        "CJK Scripts": ["hani", "jpan", "hang"],
+        "Indic Scripts": [
+            "deva",
+            "beng",
+            "gujr",
+            "guru",
+            "knda",
+            "mlym",
+            "mymr",
+            "orya",
+            "sinh",
+            "taml",
+            "telu",
+            "tibt",
+        ],
+        "Southeast Asian Scripts": ["thai", "khmr", "laoo"],
+    }
+    family_presets: Dict[str, List[str]] = {}
+    for family, codes in SCRIPT_FAMILIES.items():
+        family_presets[family] = [
+            lk for lk, s in script_map.items() if s in codes
+        ]
+
+    # Coding/script buckets preserved as convenient groupings
+    categories: Dict[str, List[str]] = {
         "All Languages": ordered_all_languages,
         "Top 30 Natural": top_30_natural,
         "31–60 Natural": natural_31_60,
@@ -139,3 +181,13 @@ def detect_language_types(df: pd.DataFrame) -> Dict[str, List[str]]:
         "Arabic Script": arabic_script,
         "CJK Scripts": cjk_scripts,
     }
+    # Append per-script presets (sorted for stable ordering)
+    for key in sorted(per_script.keys()):
+        categories[key] = per_script[key]
+    # Append family presets (sorted for stable ordering)
+    for key in sorted(family_presets.keys()):
+        # Don't clobber an existing single-script preset of the same name
+        if key not in categories:
+            categories[key] = family_presets[key]
+
+    return categories

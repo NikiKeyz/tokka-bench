@@ -15,12 +15,15 @@ import hashlib
 import random
 import json
 import os
+import statistics
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from transformers import AutoTokenizer
+
+from .tokenizer import _load_raw_tokenizer
 
 from .data_utils import (
     get_english_fineweb,
@@ -53,7 +56,18 @@ class FastTokenizer:
 
     def __post_init__(self) -> None:
         # trust_remote_code=True allows custom tokenizers (e.g., tiktoken-wrapped)
-        self._tok = AutoTokenizer.from_pretrained(self.name, trust_remote_code=True)
+        try:
+            self._tok = AutoTokenizer.from_pretrained(
+                self.name, trust_remote_code=True
+            )
+        except Exception as e:
+            # Fall back to loading the raw tokenizer.json directly. This handles
+            # models whose tokenizer_config.json uses a format the installed
+            # transformers version cannot parse (e.g. Gemma 4).
+            print(
+                f"    ⚠️  AutoTokenizer failed ({e}); falling back to raw tokenizer.json"
+            )
+            self._tok = _load_raw_tokenizer(self.name)
         self.vocab_size: int = len(self._tok)
 
     # Expose a minimal protocol expected by metrics functions
@@ -217,6 +231,32 @@ def _sample_token_info_for_global(
     return tokens_info
 
 
+def _process_single_language_with_retry(
+    tokenizers: List[FastTokenizer],
+    lang_info: Dict[str, str],
+    sample_size_mb: float,
+    max_retries: int = 3,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, List[Dict[str, Any]]]]:
+    """Run ``_process_single_language`` with retries for transient failures.
+
+    Transient errors (HF dataset races, ``tqdm`` lock corruption, network
+    blips) are common under high ``max_workers``; retrying usually succeeds.
+    """
+    import time
+
+    name = lang_info.get("name", "Unknown")
+    last_err: Exception = RuntimeError("no attempts made")
+    for attempt in range(1, max_retries + 1):
+        try:
+            return _process_single_language(tokenizers, lang_info, sample_size_mb)
+        except Exception as e:  # noqa: BLE001 - retry on any transient failure
+            last_err = e
+            if attempt < max_retries:
+                time.sleep(0.5 * attempt)
+                continue
+    raise RuntimeError(f"{name}: failed after {max_retries} attempts: {last_err}")
+
+
 def _process_single_language(
     tokenizers: List[FastTokenizer],
     lang_info: Dict[str, str],
@@ -281,6 +321,63 @@ def _process_single_language(
         per_tokenizer_sampled_tokens[tok.name] = tokens_info
 
     return per_tokenizer_metrics, per_tokenizer_sampled_tokens
+
+
+def _script_stat_block(values: List[float], keys: List[str]) -> Dict[str, Any]:
+    """Return min/median/max plus the language holding the min/max value.
+
+    ``values`` and ``keys`` are parallel lists (one entry per language in the
+    script group). For bytes/token the *min* is the worst case for context
+    overflow (fewest bytes per token -> more tokens per byte).
+    """
+    if not values:
+        return {}
+
+    paired = sorted(zip(values, keys))
+    min_v, min_k = paired[0]
+    max_v, max_k = paired[-1]
+    return {
+        "min": min_v,
+        "median": statistics.median(values),
+        "max": max_v,
+        "min_language": min_k,
+        "max_language": max_k,
+    }
+
+
+def aggregate_by_script(
+    languages: Dict[str, Dict[str, Any]]
+) -> Dict[str, Dict[str, Any]]:
+    """Group per-language results by Unicode script and summarize metrics.
+
+    Produces ``min``/``median``/``max`` (with the holding language) for the
+    metrics that matter for coverage and overflow safety: ``bytes_per_token``,
+    ``unique_tokens`` and ``subword_fertility``. Rare languages are already
+    excluded by the top-N language selection upstream, so the min reflects a
+    realistic worst case for that script.
+    """
+    groups: Dict[str, Dict[str, Any]] = {}
+    for lang_key, lang_result in languages.items():
+        script = lang_result.get("language_info", {}).get("script", "Unknown")
+        g = groups.setdefault(
+            script,
+            {"keys": [], "bpt": [], "ut": [], "fert": []},
+        )
+        g["keys"].append(lang_key)
+        g["bpt"].append(lang_result.get("metrics", {}).get("bytes_per_token", 0.0))
+        g["ut"].append(lang_result.get("metrics", {}).get("unique_tokens", 0))
+        g["fert"].append(lang_result.get("metrics", {}).get("subword_fertility", 0.0))
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for script, g in groups.items():
+        out[script] = {
+            "num_languages": len(g["keys"]),
+            "languages": g["keys"],
+            "bytes_per_token": _script_stat_block(g["bpt"], g["keys"]),
+            "unique_tokens": _script_stat_block(g["ut"], g["keys"]),
+            "subword_fertility": _script_stat_block(g["fert"], g["keys"]),
+        }
+    return out
 
 
 def run_benchmark(
@@ -366,7 +463,10 @@ def run_benchmark(
     with ThreadPoolExecutor(max_workers=effective_workers) as executor:
         futures = {
             executor.submit(
-                _process_single_language, tokenizers, lang, sample_size_mb
+                _process_single_language_with_retry,
+                tokenizers,
+                lang,
+                sample_size_mb,
             ): lang
             for lang in all_languages
         }
@@ -409,6 +509,10 @@ def run_benchmark(
     print("🔄 Finalizing global metrics...")
     for tok_name, tracker in global_trackers.items():
         all_results[tok_name]["global_metrics"] = tracker.get_global_metrics()
+        # Group per-language metrics by script (worst-case aware summaries)
+        all_results[tok_name]["script_aggregations"] = aggregate_by_script(
+            all_results[tok_name]["languages"]
+        )
 
     # Save results per tokenizer
     saved_files: List[str] = []
