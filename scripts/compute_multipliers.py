@@ -34,21 +34,20 @@ written for each base, plus a combined cross-base table:
 
     uv run python scripts/compute_multipliers.py --batch --target tencent/Hy3
 
-The per-base multiplier rows include ``mult_spread = mult_max / mult_median`` -- a
-measure of how variable the per-language multipliers are within a script
-(1.0 = uniform, larger = more uneven). The cross-base spread output has two
-tables, both restricted to scripts with ``n_langs > 1`` (single-language
-scripts trivially have a spread of 1.0 and are excluded):
+The per-base multiplier rows include ``mult_spread = mult_max / mult_median``
+and ``mult_spread_minmax = mult_max / mult_min`` -- two measures of how
+variable the per-language multipliers are within a script (1.0 = uniform).
+The cross-base spread output has two tables, both restricted to scripts with
+``n_langs > 1`` (single-language scripts trivially have a spread of 1.0 and
+are excluded):
 
-  * Per tokenizer: one row per base reports ``spread_min`` / ``spread_median`` /
-    ``spread_max`` of its per-script spreads, sorted by ``spread_max`` ascending
-    -- the tokenizer with the smallest worst-case (maximum) per-script spread
-    appears first.
+  * Per tokenizer: one row per base reports per-script aggregates of both spread
+    metrics (``spr_min`` / ``spr_median`` / ``spr_max`` for mult_spread;
+    ``mm_min`` / ``mm_median`` / ``mm_max`` for mult_spread_minmax), sorted by
+    ``spr_max`` ascending -- the tokenizer with the smallest worst-case
+    ``mult_spread`` appears first.
   * Per script: one row per script lists the ``mult_spread`` seen under every
-    base tokenizer, plus per-script aggregates (min / median / max across bases).
-
-Both are written to CSV (``spread_<target>_vs_tiktoken_bases.csv`` and
-``..._by_script.csv``).
+    base tokenizer, plus per-script aggregates for both metrics.
 
 Target-only (no base tokenizer) safety mode
 -------------------------------------------
@@ -116,8 +115,9 @@ def compute_multipliers(base_result: dict, target_result: dict) -> list:
     """Return per-script multiplier rows comparing base vs target.
 
     Each row: script, n_langs, mult_min, mult_median, mult_max,
-    mult_spread (mult_max / mult_median, a measure of how variable the per-language
-    multipliers are within the script), worst_lang (lang with the max ratio),
+    mult_spread (mult_max / mult_median, a measure of upward variability across
+    languages in the script), mult_spread_minmax (mult_max / mult_min, a wider
+    range that also captures low-side outliers), worst_lang (lang with the max ratio),
     worst_ratio, base_median_bpt, target_median_bpt.
     """
     base_map = script_language_bpt(base_result)
@@ -150,15 +150,18 @@ def compute_multipliers(base_result: dict, target_result: dict) -> list:
                 worst_lang = lang_key
         if not ratios:
             continue
+        mmed = statistics.median(ratios)
         mmax = max(ratios)
+        mmin = min(ratios)
         rows.append(
             {
                 "script": script,
                 "n_langs": len(ratios),
-                "mult_min": min(ratios),
-                "mult_median": statistics.median(ratios),
+                "mult_min": mmin,
+                "mult_median": mmed,
                 "mult_max": mmax,
-                "mult_spread": (mmax / statistics.median(ratios)) if statistics.median(ratios) > 0 else float("inf"),
+                "mult_spread": (mmax / mmed) if mmed > 0 else float("inf"),
+                "mult_spread_minmax": (mmax / mmin) if mmin > 0 else float("inf"),
                 "worst_lang": worst_lang,
                 "worst_ratio": worst_ratio,
                 "base_median_bpt": statistics.median(base_vals),
@@ -231,6 +234,7 @@ def write_multiplier_csv(rows: list, out_path: Path) -> None:
                 "mult_median",
                 "mult_max",
                 "mult_spread",
+                "mult_spread_minmax",
                 "worst_lang",
                 "worst_ratio",
                 "base_median_bpt",
@@ -245,64 +249,80 @@ def build_cross_base_table(all_rows: list) -> tuple:
     """Build cross-base spread tables from per-base multiplier rows.
 
     ``all_rows`` is a list of ``(base_name, rows)`` where each ``rows`` is the
-    output of :func:`compute_multipliers`. For each base tokenizer we collect the
-    per-script ``mult_spread`` (mult_max / mult_median), but ONLY for scripts with
+    output of :func:`compute_multipliers``. For each base tokenizer we collect the
+    per-script ``mult_spread`` (mult_max / mult_median) and
+    ``mult_spread_minmax`` (mult_max / mult_min), but ONLY for scripts with
     ``n_langs > 1`` (a single-language script has a trivial spread of 1 and is
     meaningless to compare).
 
     Two tables are returned:
 
-    * ``by_tokenizer`` -- one row per base tokenizer, aggregating the per-script
-      spreads across all qualifying scripts::
+    * ``by_tokenizer`` -- one row per base tokenizer, aggregating both spread
+      metrics across all qualifying scripts::
 
-          base, n_scripts, spread_min, spread_median, spread_max
+          base, n_scripts,
+          spr_min, spr_median, spr_max,     # for mult_spread (max/median)
+          mm_min, mm_median, mm_max         # for mult_spread_minmax (max/min)
 
-      sorted by ``spread_max`` ascending, so the tokenizer with the smallest
-      worst-case (maximum) spread across scripts appears first.
-    * ``by_script`` -- one row per script, listing the ``mult_spread`` seen under
-      every base tokenizer plus per-script aggregates (min / median / max across
-      bases)::
+      sorted by ``spr_max`` ascending, so the tokenizer with the smallest
+      worst-case (maximum) mult_spread appears first.
+    * ``by_script`` -- one row per script, listing the ``mult_spread`` seen
+      under every base tokenizer plus per-script aggregates for both metrics::
 
-          script, n_bases, <one column per base>, spread_min, spread_median, spread_max
+          script, n_bases, <one column per base>,
+          spr_min, spr_median, spr_max,     # for mult_spread (max/median)
+          mm_min, mm_median, mm_max         # for mult_spread_minmax (max/min)
     """
     base_names = [name for name, _ in all_rows]
 
-    # Per-tokenizer aggregation across qualifying scripts.
     by_tokenizer = []
-    # Per-script spread per base: script -> {base_name: spread}
     by_script: dict = {}
+
     for base_name, rows in all_rows:
-        spreads = []
+        spreads = []      # mult_spread (max/median)
+        spreads_mm = []   # mult_spread_minmax (max/min)
         for r in rows:
-            if r["n_langs"] <= 1 or r["mult_spread"] == float("inf"):
+            if r["n_langs"] <= 1:
                 continue
-            spread = r["mult_spread"]
-            spreads.append(spread)
-            by_script.setdefault(r["script"], {})[base_name] = spread
+            sp = r["mult_spread"]
+            sp_mm = r["mult_spread_minmax"]
+            if sp == float("inf") or sp_mm == float("inf"):
+                continue
+            spreads.append(sp)
+            spreads_mm.append(sp_mm)
+            by_script.setdefault(r["script"], {})[base_name] = (sp, sp_mm)
+
         if spreads:
             by_tokenizer.append(
                 {
                     "base": base_name,
                     "n_scripts": len(spreads),
-                    "spread_min": min(spreads),
-                    "spread_median": statistics.median(spreads),
-                    "spread_max": max(spreads),
+                    "spr_min": min(spreads),
+                    "spr_median": statistics.median(spreads),
+                    "spr_max": max(spreads),
+                    "mm_min": min(spreads_mm),
+                    "mm_median": statistics.median(spreads_mm),
+                    "mm_max": max(spreads_mm),
                 }
             )
-    by_tokenizer.sort(key=lambda r: r["spread_max"])
+    by_tokenizer.sort(key=lambda r: r["spr_max"])
 
     by_script_rows = []
     for script in sorted(by_script.keys()):
         per_base = by_script[script]
-        vals = list(per_base.values())
+        vals = [v[0] for v in per_base.values()]   # mult_spread values
+        vals_mm = [v[1] for v in per_base.values()] # mult_spread_minmax values
         by_script_rows.append(
             {
                 "script": script,
                 "n_bases": len(per_base),
                 "per_base": per_base,
-                "spread_min": min(vals),
-                "spread_median": statistics.median(vals),
-                "spread_max": max(vals),
+                "spr_min": min(vals),
+                "spr_median": statistics.median(vals),
+                "spr_max": max(vals),
+                "mm_min": min(vals_mm),
+                "mm_median": statistics.median(vals_mm),
+                "mm_max": max(vals_mm),
             }
         )
 
@@ -437,39 +457,43 @@ def main() -> int:
         # Table 1: per-tokenizer aggregation across scripts.
         print()
         print(f"Cross-base spread table -- per tokenizer (target: {target_name})")
-        print("  spread = mult_max / mult_median, restricted to scripts with n_langs > 1")
-        print("  sorted by spread_max ascending (top = smallest worst-case spread)")
+        print("  spp = mult_max / mult_median (sorting key);  mm = mult_max / mult_min (info)")
+        print("  restricted to scripts with n_langs > 1")
         print()
         header = (
             f"{'base':<26}{'#scr':>5}"
-            f"{'spread_min':>12}{'spread_med':>12}{'spread_max':>12}"
+            f"{'spr_min':>9}{'spr_med':>9}{'spr_max':>9}"
+            f"{'mm_min':>9}{'mm_med':>9}{'mm_max':>9}"
         )
         print(header)
         print("-" * len(header))
         for r in by_tokenizer:
             print(
                 f"{r['base']:<26}{r['n_scripts']:>5}"
-                f"{r['spread_min']:>12.3f}{r['spread_median']:>12.3f}"
-                f"{r['spread_max']:>12.3f}"
+                f"{r['spr_min']:>9.3f}{r['spr_median']:>9.3f}{r['spr_max']:>9.3f}"
+                f"{r['mm_min']:>9.3f}{r['mm_median']:>9.3f}{r['mm_max']:>9.3f}"
             )
 
         # Table 2: per-script spread across tokenizers.
         print()
         print(f"Cross-base spread table -- per script (target: {target_name})")
         base_cols = [normalize(b)[:10] for b in base_names]
-        header = f"{'script':<8}{'#b':>4}" + "".join(
-            f"{c:>11}" for c in base_cols
-        ) + f"{'spread_min':>12}{'spread_med':>12}{'spread_max':>12}"
+        spr_cols = "".join(f"{c:>11}" for c in base_cols)
+        header = (
+            f"{'script':<8}{'#b':>4}{spr_cols}"
+            f"{'spr_min':>9}{'spr_med':>9}{'spr_max':>9}"
+            f"{'mm_min':>9}{'mm_med':>9}{'mm_max':>9}"
+        )
         print(header)
         print("-" * len(header))
         for r in by_script:
             line = f"{r['script']:<8}{r['n_bases']:>4}"
             for b, c in zip(base_names, base_cols):
                 v = r["per_base"].get(b)
-                line += f"{(f'{v:.3f}' if v is not None else '-'):>11}"
+                line += f"{v[0]:>11.3f}" if v is not None else f"{'-':>11}"
             line += (
-                f"{r['spread_min']:>12.3f}{r['spread_median']:>12.3f}"
-                f"{r['spread_max']:>12.3f}"
+                f"{r['spr_min']:>9.3f}{r['spr_median']:>9.3f}{r['spr_max']:>9.3f}"
+                f"{r['mm_min']:>9.3f}{r['mm_median']:>9.3f}{r['mm_max']:>9.3f}"
             )
             print(line)
 
@@ -485,9 +509,12 @@ def main() -> int:
                 fieldnames=[
                     "base",
                     "n_scripts",
-                    "spread_min",
-                    "spread_median",
-                    "spread_max",
+                    "spr_min",
+                    "spr_median",
+                    "spr_max",
+                    "mm_min",
+                    "mm_median",
+                    "mm_max",
                 ],
             )
             writer.writeheader()
@@ -500,9 +527,12 @@ def main() -> int:
             / f"spread_{normalize(target_name)}_vs_tiktoken_bases_by_script.csv"
         )
         fields = ["script", "n_bases"] + [normalize(b) for b in base_names] + [
-            "spread_min",
-            "spread_median",
-            "spread_max",
+            "spr_min",
+            "spr_median",
+            "spr_max",
+            "mm_min",
+            "mm_median",
+            "mm_max",
         ]
         with open(scr_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fields)
@@ -510,10 +540,14 @@ def main() -> int:
             for r in by_script:
                 row = {"script": r["script"], "n_bases": r["n_bases"]}
                 for b in base_names:
-                    row[normalize(b)] = r["per_base"].get(b)
-                row["spread_min"] = r["spread_min"]
-                row["spread_median"] = r["spread_median"]
-                row["spread_max"] = r["spread_max"]
+                    v = r["per_base"].get(b)
+                    row[normalize(b)] = v[0] if v is not None else None
+                row["spr_min"] = r["spr_min"]
+                row["spr_median"] = r["spr_median"]
+                row["spr_max"] = r["spr_max"]
+                row["mm_min"] = r["mm_min"]
+                row["mm_median"] = r["mm_median"]
+                row["mm_max"] = r["mm_max"]
                 writer.writerow(row)
         print(f"Wrote per-script spread CSV: {scr_path}")
         return 0
