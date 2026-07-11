@@ -3,10 +3,7 @@ import csv, sys, pathlib, glob
 DATA = pathlib.Path(__file__).resolve().parent.parent / "data" / "results"
 
 def compute(row):
-    spread = float(row["mult_spread"])
-    if spread > 1.1:
-        return round(float(row["mult_max"]) / 1.1, 3)
-    return round(float(row["mult_median"]), 3)
+    return round(float(row["mult_max"]), 3)
 
 def convert(tokenizer: str):
     result = {}
