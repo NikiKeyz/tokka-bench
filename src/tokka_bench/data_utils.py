@@ -6,12 +6,13 @@ from various datasets (FineWeb-2, StarCoder, FineWeb).
 """
 
 import gc
-import hashlib
 import os
 import time
 from typing import Dict, List
 
 import pandas as pd
+
+from .unicode_utils import check_script_purity
 
 # Local on-disk cache for per-language sample text. Only the ~sample_size_mb
 # that is actually consumed is stored (never the full dataset), so 100 languages
@@ -151,15 +152,22 @@ def _sample_cache_path(
     language_info: Dict[str, str],
     sample_size_mb: float,
     cache_dir: str,
+    purity_threshold: float = 0.0,
 ) -> str:
-    """Stable cache file path for a given language + sample size."""
+    """Human-readable cache file path for a given language + parameters.
+
+    Pattern: ``{source}_{iso}_{script}[_{data_dir}]_{sample_size_mb}mb_p{purity_threshold}.txt``
+    Uniquely identifies the language, source, sample size, and purity threshold
+    so cached files can be found by name for external reuse (e.g. testing in Veska).
+    """
     source = language_info.get("source", "fineweb2")
     iso = language_info.get("iso_code", "")
     script = language_info.get("script", "")
     data_dir = language_info.get("data_dir", "")
-    raw = f"{source}|{iso}|{script}|{data_dir}|{sample_size_mb}"
-    key = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
-    return os.path.join(cache_dir, f"{key}.txt")
+    purity_part = f"_p{purity_threshold}" if purity_threshold > 0.0 else ""
+    data_dir_part = f"_{data_dir}" if data_dir else ""
+    name = f"{source}_{iso}_{script}{data_dir_part}_{sample_size_mb}mb{purity_part}.txt"
+    return os.path.join(cache_dir, name)
 
 
 def load_real_sample_text(
@@ -169,6 +177,7 @@ def load_real_sample_text(
     max_retries: int = 3,
     use_cache: bool = True,
     cache_dir: str = SAMPLE_CACHE_DIR,
+    purity_threshold: float = 0.0,
 ) -> str:
     """Load real sample text from appropriate dataset based on source.
 
@@ -178,6 +187,13 @@ def load_real_sample_text(
     ``CastError`` or ``tqdm`` lock races under high concurrency), and
     re-attempts when a stream yields zero bytes. Never falls back to synthetic
     text — failures raise after retries are exhausted.
+
+    When ``purity_threshold > 0.0``, each document from the stream is checked
+    for script purity: characters belonging to the target script (as defined by
+    the ``language_info["script"]`` code) plus always-native categories
+    (Punctuation, Symbols, Numbers, Common/Inherited/Unknown) are counted as
+    native. Documents with a native fraction below the threshold are skipped.
+    This ensures the sample contains minimal cross-script contamination.
     """
     from datasets import load_dataset
 
@@ -188,7 +204,7 @@ def load_real_sample_text(
     cache_path = ""
     if use_cache:
         os.makedirs(cache_dir, exist_ok=True)
-        cache_path = _sample_cache_path(language_info, sample_size_mb, cache_dir)
+        cache_path = _sample_cache_path(language_info, sample_size_mb, cache_dir, purity_threshold)
         if os.path.exists(cache_path):
             try:
                 with open(cache_path, "r", encoding="utf-8") as f:
@@ -259,15 +275,22 @@ def load_real_sample_text(
             # Accumulate text until we reach target size
             accumulated_text: List[str] = []
             total_bytes: int = 0
+            docs_skipped: int = 0
 
             dataset_iter = iter(fw)
             try:
                 while total_bytes < target_bytes:
                     sample = next(dataset_iter)
                     text: str = sample.get(content_key, "")
-                    if text:
-                        accumulated_text.append(text)
-                        total_bytes += len(text.encode("utf-8"))
+                    if not text:
+                        continue
+                    if purity_threshold > 0.0:
+                        purity = check_script_purity(text, language_info["script"])
+                        if purity < purity_threshold:
+                            docs_skipped += 1
+                            continue
+                    accumulated_text.append(text)
+                    total_bytes += len(text.encode("utf-8"))
             except StopIteration:
                 # End of dataset reached
                 pass
@@ -295,6 +318,10 @@ def load_real_sample_text(
                 print(
                     f"    Loaded {len(full_text.encode('utf-8')):,} bytes of real data"
                 )
+                if docs_skipped > 0:
+                    print(
+                        f"    Skipped {docs_skipped} docs below {purity_threshold:.0%} purity"
+                    )
 
             # Persist to local cache (atomic write) for subsequent runs.
             if use_cache:

@@ -12,6 +12,7 @@ DEFAULT_SAMPLE_SIZE = 2.0
 DEFAULT_MAX_WORKERS = 4
 DEFAULT_NATURAL_LANGUAGES = 99
 DEFAULT_CODE_LANGUAGES = 20
+DEFAULT_PURITY_THRESHOLD = 0.0
 
 # Output formatting constants
 TABLE_WIDTH = 80
@@ -204,7 +205,8 @@ def parse_config():
         "max_workers": config.get("max_workers", DEFAULT_MAX_WORKERS),
         "natural_n": config.get("natural_n", None),
         "code_n": config.get("code_n", None),
-        "natural_lang_list": config.get("natural_lang_list", None)
+        "natural_lang_list": config.get("natural_lang_list", None),
+        "purity_threshold": config.get("purity_threshold", DEFAULT_PURITY_THRESHOLD)
     }
 
 
@@ -294,7 +296,7 @@ def generate_output_filename(tokenizer_name, output_name=None):
         return f"{RESULTS_DIR}/{safe_name}{JSON_EXTENSION}"
 
 
-def print_configuration(tokenizer_list, output_name_list, sample_size, max_workers):
+def print_configuration(tokenizer_list, output_name_list, sample_size, max_workers, purity_threshold=0.0):
     """Print benchmark configuration."""
     if len(tokenizer_list) == 1:
         print(f"Tokenizer: {tokenizer_list[0]}")
@@ -309,6 +311,8 @@ def print_configuration(tokenizer_list, output_name_list, sample_size, max_worke
             output_file = generate_output_filename(tok, output_name)
             print(f"  {i + 1}. {tok} → {output_file}")
 
+    if purity_threshold > 0.0:
+        print(f"Script purity threshold: {purity_threshold:.0%}")
     print(f"Sample size: {sample_size}MB per language")
     if len(tokenizer_list) > 1:
         print(f"Parallel workers: {max_workers}")
@@ -338,6 +342,7 @@ def main():
             output_name_list,
             config["sample_size"],
             config["max_workers"],
+            config["purity_threshold"],
         )
 
         # Run benchmark
@@ -358,6 +363,7 @@ def main():
             config["code_n"]
             if config["code_n"] is not None
             else DEFAULT_CODE_LANGUAGES,
+            purity_threshold=config["purity_threshold"],
         )
 
         # Print results

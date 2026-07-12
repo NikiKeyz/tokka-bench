@@ -235,6 +235,7 @@ def _process_single_language_with_retry(
     tokenizers: List[FastTokenizer],
     lang_info: Dict[str, str],
     sample_size_mb: float,
+    purity_threshold: float = 0.0,
     max_retries: int = 3,
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, List[Dict[str, Any]]]]:
     """Run ``_process_single_language`` with retries for transient failures.
@@ -248,7 +249,7 @@ def _process_single_language_with_retry(
     last_err: Exception = RuntimeError("no attempts made")
     for attempt in range(1, max_retries + 1):
         try:
-            return _process_single_language(tokenizers, lang_info, sample_size_mb)
+            return _process_single_language(tokenizers, lang_info, sample_size_mb, purity_threshold=purity_threshold)
         except Exception as e:  # noqa: BLE001 - retry on any transient failure
             last_err = e
             if attempt < max_retries:
@@ -261,6 +262,7 @@ def _process_single_language(
     tokenizers: List[FastTokenizer],
     lang_info: Dict[str, str],
     sample_size_mb: float,
+    purity_threshold: float = 0.0,
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, List[Dict[str, Any]]]]:
     """Return per-tokenizer metrics and sampled token infos for global metrics.
 
@@ -268,7 +270,7 @@ def _process_single_language(
     - Load and concatenate ~sample_size_mb of text for the language once.
     - For each tokenizer: encode once; reuse token IDs for metrics and global sampling.
     """
-    text: str = load_real_sample_text(lang_info, sample_size_mb, verbose=False)
+    text: str = load_real_sample_text(lang_info, sample_size_mb, verbose=False, purity_threshold=purity_threshold)
     # Deterministic per-language seed for reproducible sampling
     iso = lang_info.get("iso_code", "")
     script = lang_info.get("script", "")
@@ -388,6 +390,7 @@ def run_benchmark(
     natural_n: int = 99,
     natural_lang_list: List[str] = [],
     code_n: int = 20,
+    purity_threshold: float = 0.0,
 ) -> Dict[str, Any]:
     """Benchmark multiple tokenizers across many languages quickly.
 
@@ -397,8 +400,9 @@ def run_benchmark(
         raise ValueError("tokenizer_names must be a non-empty list")
 
     # Quiet header; a single compact line
+    purity_note = f" purity={purity_threshold:.0%}" if purity_threshold > 0.0 else ""
     print(
-        f"🚀 Fast benchmark | tokenizers={len(tokenizer_names)} | sample={sample_size_mb}MB | workers={max_workers}"
+        f"🚀 Fast benchmark | tokenizers={len(tokenizer_names)} | sample={sample_size_mb}MB | workers={max_workers}{purity_note}"
     )
 
     # Load tokenizers (quiet)
@@ -467,6 +471,7 @@ def run_benchmark(
                 tokenizers,
                 lang,
                 sample_size_mb,
+                purity_threshold,
             ): lang
             for lang in all_languages
         }
