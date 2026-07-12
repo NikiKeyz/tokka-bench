@@ -9,10 +9,11 @@ def convert(raw: str):
         for row in reader:
             script = row["script"]
             spread = float(row["mult_spread"])
-            if spread > 1.1:
-                val = round(float(row["mult_max"]) / 1.1, 3)
-            else:
-                val = round(float(row["mult_median"]), 3)
+            # if spread > 1.1:
+            #     val = round(float(row["mult_max"]) / 1.1, 3)
+            # else:
+            #     val = round(float(row["mult_median"]), 3)
+            val = val = round(float(row["mult_max"]), 3)
             pairs.append(f"{script} = {val}")
     toml_path.write_text("m_prior = {" + ", ".join(pairs) + "}\n")
     print(f"Wrote {toml_path}")
