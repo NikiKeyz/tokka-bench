@@ -23,7 +23,7 @@ MATHEMATICAL_KEYWORDS = {"MATHEMATICAL", "DOUBLE-STRUCK"}
 UNICODE_SCRIPTS: Dict[str, List[str]] = {
     "Korean": ["HANGUL"],  # Must come before Chinese to avoid HAN matching in HANGUL
     "Japanese": ["HIRAGANA", "KATAKANA"],
-    "Chinese": ["CJK", "HAN"],  # CJK covers Chinese ideographs
+    "Chinese": ["CJK"],  # CJK covers all CJK ideographs without false matches
     "Latin": ["LATIN"],
     "Cyrillic": ["CYRILLIC"],
     "Arabic": ["ARABIC"],
