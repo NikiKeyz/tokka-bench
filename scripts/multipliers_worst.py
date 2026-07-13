@@ -3,7 +3,7 @@ import csv, sys, pathlib, glob
 DATA = pathlib.Path(__file__).resolve().parent.parent / "data" / "results"
 
 def compute(row):
-    return round(float(row["mult_max"]), 3)
+    return max(round(float(row["mult_max"]), 3), 1.0)
 
 def convert(tokenizer: str):
     result = {}
